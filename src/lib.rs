@@ -9,15 +9,91 @@ pub fn add(left: usize, right: usize) -> usize {
 impl_parse_for_enum!(Type, le_u16);
 impl_parse_for_enum!(Machine, le_u16);
 
-/* #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Type {
-    None,
-    Rel,
-    Exec,
-    Dyn,
-    Core,
+impl_parse_for_enum!(SegmentFlag, le_u32);
+
+pub struct ProgramHeader {
+    pub r#type: SegmentType,
+    pub flags: BitFlags<SegmentFlag>,
+    pub offset: Addr,
+    pub vaddr: Addr,
+    pub paddr: Addr,
+    pub filesz: Addr,
+    pub memsz: Addr,
+    pub align: Addr,
+    pub data: Vec<u8>,
 }
- */
+
+use std::ops::Range;
+
+impl ProgramHeader {
+    /**
+     * File range where the segment is stored
+     */
+    pub fn file_range(&self) -> Range<Addr> {
+        self.offset..self.offset + self.filesz
+    }
+
+    /**
+     * Memory range where the segment is mapped
+     */
+    pub fn mem_range(&self) -> Range<Addr> {
+        self.vaddr..self.vaddr + self.memsz
+    }
+}
+
+impl fmt::Debug for ProgramHeader {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "file {:?} | mem {:?} | align {:?} | {} {:?}",
+            self.file_range(),
+            self.mem_range(),
+            self.align,
+            // the default Debug formatter for `enumflags2` is a bit
+            // on the verbose side, let's print something like `RWX` instead
+            &[
+                (SegmentFlag::Read, "R"),
+                (SegmentFlag::Write, "W"),
+                (SegmentFlag::Execute, "X")
+            ]
+            .iter()
+            .map(|&(flag, letter)| {
+                if self.flags.contains(flag) {
+                    letter
+                } else {
+                    "."
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+            self.r#type,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum SegmentType {
+    Null = 0x0,
+    Load = 0x1,
+    Dynamic = 0x2,
+    Interp = 0x3,
+    Note = 0x4,
+    ShLib = 0x5,
+    PHdr = 0x6,
+    TLS = 0x7,
+    LoOS = 0x6000_0000,
+    HiOS = 0x6FFF_FFFF,
+    LoProc = 0x7000_0000,
+    HiProc = 0x7FFF_FFFF,
+    GnuEhFrame = 0x6474_E550,
+    GnuStack = 0x6474_E551,
+    GnuRelRo = 0x6474_E552,
+    GnuProperty = 0x6474_E553,
+}
+
+ 
+ impl_parse_for_enum!(SegmentType, le_u32);
 
  #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
 #[repr(u16)]
@@ -64,21 +140,30 @@ impl Type {
 
 #[cfg(test)]
 mod tests {
-    use super::Machine;
-    use std::convert::TryFrom;
-
     #[test]
-    fn try_enums() {
-        assert_eq!(Machine::X86_64 as u16, 0x3E);
-        assert_eq!(Machine::try_from(0x3E), Ok(Machine::X86_64));
-        assert_eq!(Machine::try_from(0xFA), Err(0xFA));
+    fn try_bitflag() {
+        use super::SegmentFlag;
+        use enumflags2::BitFlags;
+
+        // this is a value we could've read straight from an ELF file
+        let flags_integer: u32 = 6;
+        // this is how we parse it. in practice, it's less verbose,
+        // because of type inference.
+        let flags = BitFlags::<SegmentFlag>::from_bits(flags_integer).unwrap();
+        assert_eq!(flags, SegmentFlag::Read | SegmentFlag::Write);
+        assert_eq!(flags.bits(), flags_integer);
+
+        // this does not correspond to any flags
+        assert!(BitFlags::<SegmentFlag>::from_bits(1992).is_err());
     }
 }
+
 
 #[derive(Debug)]
 pub struct File {
     pub r#type: Type,
     pub machine: Machine,
+    pub program_headers: Vec<ProgramHeader>,
 }
 
 pub struct HexDump<'a>(&'a [u8]);
@@ -99,7 +184,9 @@ impl File {
     // omitted: magic constant
     const MAGIC: &'static [u8] = &[0x7f, 0x45, 0x4c, 0x46];
 
+    #[allow(unused_variables)]
     pub fn parse(i: parse::Input) -> parse::Result<Self> {
+        let full_input = i;
         use nom::{
             bytes::complete::{tag, take},
             error::context,
@@ -109,15 +196,31 @@ impl File {
         };
         // omitted: parse magic, etc.
 
-        let (i, (r#type, machine)) = tuple((
-            context("Type", map(le_u16, |x| Type::try_from(x).unwrap())),
-            context("Machine", map(le_u16, |x| Machine::try_from(x).unwrap())),
-        ))(i)?;
+        use nom::{combinator::map, number::complete::le_u16};
+        // some values are stored as u16 to save storage, but they're actually
+        // file offsets, or counts, so we want them as `usize` in rust.
+        let u16_usize = map(le_u16, |x| x as usize);
 
-        // after:
-        let (i, (r#type, machine)) = tuple((Type::parse, Machine::parse))(i)?;
+        // ph = program header, sh = section header
+        let (i, (ph_offset, sh_offset)) = tuple((Addr::parse, Addr::parse))(i)?;
+        let (i, (flags, hdr_size)) = tuple((le_u32, le_u16))(i)?;
+        let (i, (ph_entsize, ph_count)) = tuple((&u16_usize, &u16_usize))(i)?;
+        let (i, (sh_entsize, sh_count, sh_nidx)) = tuple((&u16_usize, &u16_usize, &u16_usize))(i)?;
 
-        let res = Self { machine, r#type };
+        // `chunks()` divides a slice into chunks of equal size - perfect, as we know the entry size.
+        let ph_slices = (&full_input[ph_offset.into()..]).chunks(ph_entsize);
+        let mut program_headers = Vec::new();
+        for ph_slice in ph_slices.take(ph_count) {
+            let (_, ph) = ProgramHeader::parse(full_input, ph_slice)?;
+            program_headers.push(ph);
+        }
+
+        let res = Self {
+            machine,
+            r#type,
+            entry_point,
+            program_headers,
+        };
         Ok((i, res))
     }
 }
@@ -140,6 +243,30 @@ impl File {
             }
             Err(_) => panic!("unexpected nom error"),
         }
+    }
+}
+
+impl ProgramHeader {
+    fn parse<'a>(full_input: parse::Input<'_>, i: parse::Input<'a>) -> parse::Result<'a, Self> {
+        use nom::sequence::tuple;
+        let (i, (r#type, flags)) = tuple((SegmentType::parse, SegmentFlag::parse))(i)?;
+
+        let ap = Addr::parse;
+        let (i, (offset, vaddr, paddr, filesz, memsz, align)) = tuple((ap, ap, ap, ap, ap, ap))(i)?;
+
+        let res = Self {
+            r#type,
+            flags,
+            offset,
+            vaddr,
+            paddr,
+            filesz,
+            memsz,
+            align,
+            // `to_vec()` turns a slice into an owned Vec (this works because u8 is Clone+Copy)
+            data: full_input[offset.into()..][..filesz.into()].to_vec(),
+        };
+        Ok((i, res))
     }
 }
 
